@@ -25,7 +25,8 @@ const TOOL_REGISTRY = {
     ...collectionTools,
     ...attributeTools,
     ...conversationTools,
-    ...discoveryTools
+    ...discoveryTools,
+    // ...require('./task') // DISABLED: Task system disabled by user request
 };
 
 /**

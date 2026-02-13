@@ -1,5 +1,10 @@
 require('dotenv').config();
 const express = require('express');
+const axios = require('axios');
+
+// Backend API config (same as cart.js)
+const BACKEND_URL = process.env.BACKEND_API_URL || 'http://127.0.0.1:3000';
+const TENANT_ID = process.env.TENANT_ID || 'cbe1df05-45ed-455a-9ce6-156b0bd45713';
 const { queryAI, MODEL_ID } = require('./aiService');
 const { getIntentClassificationPrompt } = require('../legacy/intents');
 const { executeIntent } = require('../legacy/handlers');
@@ -11,12 +16,15 @@ const redisClient = require('../state/redis');
 const cors = require('cors');
 const { isConfirmation, isImplicitReference, extractSuggestion, checkSuggestionAcknowledgement } = require('../middleware/suggestionHelper');
 const { detectConversationalIntent, isResumeRequest } = require('../middleware/conversationalDetector');
+const { classifyTaskIntent } = require('../middleware/taskRouter');
 const { trackRequest, getMetrics, getMetricsSummary } = require('../utils/metrics');
 const { FEATURES, shouldUseToolSystem } = require('../middleware/featureFlags');
 const { selectTools } = require('./toolSelector');
 const { executeTools } = require('./orchestrator');
 const { getMainSystemPrompt, getToolSystemPrompt } = require('./personalities');
 const fs = require('fs');
+const taskManager = require('../state/taskManager');
+const taskTools = require('../tools/task');
 
 function logStep(msg) {
     const timestamp = new Date().toISOString();
@@ -427,10 +435,29 @@ async function generateResponseFromTools(userMessage, toolResults, conversationH
 
     const resultsSummary = JSON.stringify(optimizedResults, null, 2);
 
+    const activeTask = await taskManager.getTask(conversationHistory[0]?.session_id || '');
+    let taskContext = '';
+    if (activeTask && activeTask.status === 'active') {
+        const awaitingStep = activeTask.steps.find(s => s.status === 'awaiting_user');
+        const nextPending = activeTask.steps.find(s => s.status === 'pending');
+        const completedCount = activeTask.steps.filter(s => s.status === 'completed').length;
+        const stepProgress = activeTask.steps.map((s, i) => {
+            const icon = s.status === 'completed' ? 'DONE' : s.status === 'skipped' ? 'SKIPPED' : s.status === 'awaiting_user' ? 'CURRENT' : 'PENDING';
+            return `  ${i + 1}. [${icon}] ${s.instruction}`;
+        }).join('\n');
+        taskContext = `\nACTIVE TASK STATUS:
+- Shopping List: "${activeTask.originalRequest}"
+- Progress: ${completedCount}/${activeTask.steps.length} completed
+- Current Step: ${awaitingStep ? `"${awaitingStep.instruction}" (waiting for user action)` : nextPending ? `"${nextPending.instruction}" (about to execute)` : 'All done!'}
+- Steps:\n${stepProgress}
+TASK BEHAVIOR: You MUST guide the user through this list. After showing results, ask which to add. After cart action, mention the next item. Never close the conversation until all steps are done.
+`;
+    }
+
     const messages = [
         {
             role: "system",
-            content: getToolSystemPrompt(contextSummary, resultsSummary)
+            content: getToolSystemPrompt(contextSummary, resultsSummary) + taskContext
         },
         ...conversationHistory.slice(-3).map(h => ({
             role: h.role === 'ai' ? 'assistant' : 'user',
@@ -458,18 +485,116 @@ app.post('/chat', async (req, res) => {
     try {
         const startTime = Date.now();
 
+        // --- ADMINISTRATIVE COMMANDS ---
+        if (message.startsWith('.')) {
+            const cmd = message.toLowerCase().trim();
+            if (cmd === '.clearstate' || cmd === '.clearcache') {
+                // 1. Clear AI state (conversation history, context)
+                await stateManager.clearState(session_id);
+                // 2. Clear task engine state
+                await taskManager.clearTask(session_id);
+                // 3. Clear backend cart (lives in the DB, not Redis)
+                try {
+                    const cartRes = await axios.get(`${BACKEND_URL}/cart?session_id=${session_id}`, {
+                        headers: { 'X-Tenant-ID': TENANT_ID }
+                    });
+                    const cartItems = cartRes.data?.items || [];
+                    if (cartItems.length > 0) {
+                        for (const item of cartItems) {
+                            await axios.delete(`${BACKEND_URL}/cart/items/${item.id}`, {
+                                headers: { 'X-Tenant-ID': TENANT_ID }
+                            });
+                        }
+                        console.log(`[Admin] Cleared ${cartItems.length} cart items for session ${session_id}`);
+                    }
+                } catch (cartErr) {
+                    console.warn(`[Admin] Cart clear failed (non-critical): ${cartErr.message}`);
+                }
+                console.log(`[Admin] Full state cleared for session ${session_id}`);
+                return res.json({ success: true, reply: "✨ Everything cleared! Conversation, tasks, AND cart — fresh start, love! ✨" });
+            }
+        }
+
         // Check if we should use the new Tool System
         if (shouldUseToolSystem(session_id)) {
             console.log(`[Server] Routing session ${session_id} to NEW TOOL SYSTEM 🛠️`);
 
             // 1. Load State
             const state = await stateManager.getState(session_id);
+            let activeTask = await taskManager.getTask(session_id);
             await stateManager.addMessage(session_id, 'user', message);
 
-            // 2. AI Tool Selection
+            // TASK SYSTEM DISABLED
+            if (activeTask && activeTask.status === 'active' && false) { // DISABLED by user request
+                const awaitingStep = activeTask.steps.find(s => s.status === 'awaiting_user');
+                const pendingStep = activeTask.steps.find(s => s.status === 'pending');
+                const currentStep = awaitingStep || pendingStep;
+                console.log(`[Task] Active Task: "${activeTask.originalRequest}" | Current: "${currentStep?.instruction || 'done'}" (${currentStep?.status || 'n/a'})`);
+
+                // ── AI-POWERED TASK ROUTER ──────────────────────────────────
+                const intent = await classifyTaskIntent(message, activeTask);
+                console.log(`[TaskRouter] Intent: ${intent}`);
+
+                // ── ADVANCE: Move to next step ─────────────────────────────
+                if (intent === 'advance') {
+                    console.log(`[Task] ADVANCE → executing next step`);
+                    const executeNextTool = [{ tool: 'task.execute_next', params: {}, reason: 'User wants to advance' }];
+                    const toolResults = await executeTools(executeNextTool, session_id);
+                    let response = await generateResponseFromTools(message, toolResults, state.conversation_history);
+                    response = response.replace(/\*\*\*([^*]+)\*\*\*/g, '*$1*').replace(/\*\*([^*]+)\*\*/g, '*$1*');
+                    await stateManager.addMessage(session_id, 'ai', response);
+                    return res.json({ success: true, reply: response, tools_used: executeNextTool, results: toolResults });
+                }
+
+                // ── SKIP: Skip current step, advance ───────────────────────
+                if (intent === 'skip') {
+                    if (awaitingStep) {
+                        const idx = activeTask.steps.indexOf(awaitingStep);
+                        await taskManager.updateStep(session_id, idx, 'skipped', null, 'User skipped');
+                        console.log(`[Task] SKIP → skipped step ${idx + 1}: "${awaitingStep.instruction}"`);
+                    }
+                    const executeNextTool = [{ tool: 'task.execute_next', params: {}, reason: 'User skipped, advancing' }];
+                    const toolResults = await executeTools(executeNextTool, session_id);
+                    let response = await generateResponseFromTools(message, toolResults, state.conversation_history);
+                    response = response.replace(/\*\*\*([^*]+)\*\*\*/g, '*$1*').replace(/\*\*([^*]+)\*\*/g, '*$1*');
+                    await stateManager.addMessage(session_id, 'ai', response);
+                    return res.json({ success: true, reply: response, tools_used: executeNextTool, results: toolResults });
+                }
+
+                // ── CANCEL: Abort entire task ──────────────────────────────
+                if (intent === 'cancel') {
+                    await taskManager.clearTask(session_id);
+                    console.log(`[Task] CANCEL → task cleared`);
+                    const response = "No worries, I've cancelled your shopping list! 🧹 Feel free to start fresh anytime.";
+                    await stateManager.addMessage(session_id, 'ai', response);
+                    return res.json({ success: true, reply: response });
+                }
+
+                // ── STATUS: Show progress ──────────────────────────────────
+                if (intent === 'status') {
+                    const completed = activeTask.steps.filter(s => s.status === 'completed').length;
+                    const skipped = activeTask.steps.filter(s => s.status === 'skipped').length;
+                    const remaining = activeTask.steps.filter(s => ['pending', 'awaiting_user'].includes(s.status));
+                    const statusMsg = `📋 *Your Shopping List Progress:*\n\n` +
+                        activeTask.steps.map((s, i) => {
+                            const icon = s.status === 'completed' ? '✅' : s.status === 'skipped' ? '⏭️' : s.status === 'awaiting_user' ? '👉' : '⬜';
+                            return `${icon} ${i + 1}. ${s.instruction}`;
+                        }).join('\n') +
+                        `\n\n*${completed} done, ${skipped} skipped, ${remaining.length} remaining*`;
+                    await stateManager.addMessage(session_id, 'ai', statusMsg);
+                    return res.json({ success: true, reply: statusMsg });
+                }
+
+                // ── INTERACT: User is working with current step's results ──
+                console.log(`[Task] INTERACT → processing normally (no task augmentation)`);
+            }
+
+            // 2. AI Tool Selection (reached for non-task or "interact" intent)
             console.log('[Tool System] Selecting tools...');
             const lastSuggestion = await stateManager.getLastSuggestion(session_id);
-            let toolsSelected = await selectTools(message, state.conversation_history, lastSuggestion);
+            let augmentedMessage = message; // No task augmentation during interact
+
+            let toolsSelected = await selectTools(augmentedMessage, state.conversation_history, lastSuggestion);
 
             // Check for retry intent
             const isRetry = toolsSelected.some(t => t.tool === 'conversation.retry');
@@ -491,17 +616,74 @@ app.post('/chat', async (req, res) => {
             if (toolsSelected.length > 0) {
                 console.log(`[Tool System] Tools selected: ${toolsSelected.map(t => t.tool).join(', ')}`);
                 toolResults = await executeTools(toolsSelected, session_id);
+
+                // ── TASK STATE SYNC & AUTO-COMPLETION ──────────────────────
+                if (activeTask && activeTask.status === 'active') {
+                    const toolsRun = toolsSelected.map(t => t.tool);
+                    const awaitingStep = activeTask.steps.find(s => s.status === 'awaiting_user');
+                    const pendingStep = activeTask.steps.find(s => s.status === 'pending');
+
+                    // FIX 3: If product.search ran during interact mode while step is pending,
+                    // auto-promote step to awaiting_user (keeps task state in sync)
+                    if (!awaitingStep && pendingStep && toolsRun.includes('product.search')) {
+                        const idx = activeTask.steps.indexOf(pendingStep);
+                        await taskManager.updateStep(session_id, idx, 'awaiting_user', null, 'Auto-promoted: user searched during interact');
+                        console.log(`[Task] STATE-SYNC: Step ${idx + 1} ("${pendingStep.instruction}") promoted to awaiting_user`);
+                        // Refresh activeTask reference for the completion check below
+                        activeTask = await taskManager.getTask(session_id);
+                    }
+
+                    // AUTO-COMPLETE: If cart.add ran while step is awaiting_user, complete it
+                    const currentAwaiting = activeTask.steps.find(s => s.status === 'awaiting_user');
+                    if (currentAwaiting && currentAwaiting.completion_event && toolsRun.includes(currentAwaiting.completion_event)) {
+                        const idx = activeTask.steps.indexOf(currentAwaiting);
+                        await taskManager.updateStep(session_id, idx, 'completed', null, 'Auto-completed: completion_event triggered');
+                        console.log(`[Task] AUTO-COMPLETE: Step ${idx + 1} ("${currentAwaiting.instruction}") completed via ${currentAwaiting.completion_event}`);
+
+                        // Refresh task state for response generation
+                        const refreshedTask = await taskManager.getTask(session_id);
+                        const nextPending = refreshedTask?.steps?.find(s => s.status === 'pending');
+                        if (nextPending) {
+                            toolResults.push({
+                                tool: '_task_progress',
+                                success: true,
+                                result: {
+                                    step_completed: currentAwaiting.instruction,
+                                    next_step: nextPending.instruction,
+                                    completed_count: refreshedTask.steps.filter(s => s.status === 'completed').length,
+                                    total_steps: refreshedTask.steps.length,
+                                    prompt: `Step done! Ask the user if they're ready for: "${nextPending.instruction}"`
+                                }
+                            });
+                        } else {
+                            await taskManager.updateStatus(session_id, 'completed');
+                            toolResults.push({
+                                tool: '_task_progress',
+                                success: true,
+                                result: { task_complete: true, message: 'All items on the shopping list have been handled!' }
+                            });
+                        }
+                    }
+                }
             } else {
                 console.log('[Tool System] No tools selected (pure conversation or unclear).');
             }
 
             // 4. Response Generation
             console.log('[Tool System] Generating response via AI...');
-            const response = await generateResponseFromTools(message, toolResults, state.conversation_history);
+            let response = await generateResponseFromTools(message, toolResults, state.conversation_history);
             console.log('[Tool System] AI response received.');
 
-            // 4.5. Intelligent Image Detection (Phase 17)
-            const shouldSendImages = detectImageIntent(message, toolResults);
+            // --- FORMATTING CLEANUP (Last Mile) --- 
+            // Fix double/triple asterisks to single for WhatsApp compatibility
+            // 1. Replace ***text*** or **text** with *text*
+            response = response
+                .replace(/\*\*\*([^*]+)\*\*\*/g, '*$1*') // ***bold*** -> *bold*
+                .replace(/\*\*([^*]+)\*\*/g, '*$1*');   // **bold** -> *bold*
+
+
+            // 4.5. Intelligent Image Detection (Disabled Guard - Always Send Metadata)
+            const shouldSendImages = true; // detectImageIntent(message, toolResults);
             const imagesToSend = shouldSendImages ? await extractMentionedProductImages(response, toolResults, session_id) : [];
 
             // 5. Engagement Tracking (Phase 17)

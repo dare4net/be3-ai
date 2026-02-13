@@ -121,21 +121,72 @@ const cartTools = {
     'cart.remove': {
         description: 'Remove an item from the shopping cart',
         params: {
-            // Supports removing by cart item ID or product ID if needed, 
-            // but usually AI passes product ID or name logic
-            cart_item_id: { type: 'string', description: 'ID of the item in the cart' }
+            cart_item_id: { type: 'string', description: 'ID of the item, OR smart keywords like "all", "first", "last", "the first one", "last 2", etc.' }
         },
         handler: async (params, context) => {
             const { cart_item_id } = params;
-            if (!cart_item_id) return { error: "Cart Item ID required" };
+            const { sessionId } = context;
+            if (!cart_item_id) return { error: "Cart Item ID or keyword required" };
 
-            const result = await callBackendAPI(`/cart/items/${cart_item_id}`, {
-                method: 'DELETE'
-            });
+            // 1. Fetch current cart to resolve smart references
+            const cartResult = await callBackendAPI(`/cart?session_id=${sessionId}`);
+            if (!cartResult.success || !cartResult.data.items || cartResult.data.items.length === 0) {
+                return { message: "Cart is already empty." };
+            }
+            const items = cartResult.data.items;
 
-            if (!result.success) return { error: "Failed to remove item", details: result.error };
+            // 2. Handle "ALL"
+            const lowerId = cart_item_id.toString().toLowerCase();
+            if (lowerId === 'all' || lowerId.includes('everything') || lowerId.includes('clear')) {
+                // Determine if we need to loop or if backend has a clear endpoint. 
+                // Assuming we must loop for now if DELETE /cart/items/all failed previously.
+                // Better approach: Loop delete.
+                const errors = [];
+                for (const item of items) {
+                    const res = await callBackendAPI(`/cart/items/${item.id}`, { method: 'DELETE' });
+                    if (!res.success) errors.push(item.product_name);
+                }
+                if (errors.length > 0) return { error: `Failed to remove some items: ${errors.join(', ')}` };
+                return { success: true, message: "Cart cleared!", cart_summary: { items: [], total: 0 } };
+            }
 
-            return { success: true, message: "Item removed from cart" };
+            // 3. Handle Smart References (first, last, index)
+            let targetIds = [];
+
+            // "last X" or "first X"
+            const numberMatch = lowerId.match(/(?:last|first)\s+(\d+)/);
+            const count = numberMatch ? parseInt(numberMatch[1]) : 1;
+
+            if (lowerId.includes('first')) {
+                targetIds = items.slice(0, count).map(i => i.id);
+            } else if (lowerId.includes('last')) {
+                targetIds = items.slice(-count).map(i => i.id);
+            } else if (!isNaN(parseInt(cart_item_id)) && cart_item_id.length < 5) {
+                // User likely sent an index "1", "2"
+                const idx = parseInt(cart_item_id) - 1;
+                if (items[idx]) targetIds.push(items[idx].id);
+            } else {
+                // 4. Default: Assume it's a specific ID or Product Name matching
+                // Try exact ID match first
+                const exactMatch = items.find(i => i.id === cart_item_id);
+                if (exactMatch) targetIds.push(exactMatch.id);
+                else {
+                    // Try fuzzy name match
+                    const nameMatch = items.find(i => i.product_name.toLowerCase().includes(lowerId));
+                    if (nameMatch) targetIds.push(nameMatch.id);
+                }
+            }
+
+            if (targetIds.length === 0) {
+                return { error: `Could not find item matching "${cart_item_id}" in your cart.` };
+            }
+
+            // 5. Execute Removals
+            for (const id of targetIds) {
+                await callBackendAPI(`/cart/items/${id}`, { method: 'DELETE' });
+            }
+
+            return { success: true, message: `Removed ${targetIds.length} item(s) from cart.` };
         }
     },
     'cart.updateQuantity': {

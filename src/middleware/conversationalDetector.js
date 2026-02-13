@@ -107,6 +107,9 @@ function isResumeRequest(message) {
         /go back/i,
         /continue (with |from )?/i,
         /resume/i,
+        /next/i,
+        /go on/i,
+        /proceed/i,
         /what were we (looking at|talking about)/i,
         /where were we/i,
         /return to/i
