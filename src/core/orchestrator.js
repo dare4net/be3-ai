@@ -82,4 +82,34 @@ async function executeTools(toolsSelected, sessionId) {
     return results;
 }
 
-module.exports = { executeTools };
+/**
+ * PHASE 4: Wrapper for agent integration
+ * Execute batch of tools with context and request ID
+ * @param {Array} toolsSelected - Array of { tool, params, reason }
+ * @param {Object} context - Execution context (includes sessionId)
+ * @param {string} requestId - Request identifier
+ * @returns {Promise<Array>} Array of execution results
+ */
+async function executeBatch(toolsSelected, context, requestId = 'N/A') {
+    const Logger = require('../utils/logger');
+    const logger = new Logger('Orchestrator');
+
+    logger.info('Executing tools', {
+        requestId,
+        toolCount: toolsSelected.length,
+        tools: toolsSelected.map(t => t.tool)
+    });
+
+    const sessionId = context.sessionId || 'default-session';
+    const results = await executeTools(toolsSelected, sessionId);
+
+    logger.info('Tool execution complete', {
+        requestId,
+        successCount: results.filter(r => r.success).length,
+        errorCount: results.filter(r => !r.success).length
+    });
+
+    return results;
+}
+
+module.exports = { executeTools, executeBatch };

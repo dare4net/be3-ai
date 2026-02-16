@@ -30,70 +30,64 @@ function extractJSON(text) {
 
 /**
  * Select tools based on user message and context
+ * PHASE 4 UPDATE: Now supports agent-filtered tool selection
  * @param {string} userMessage 
  * @param {Array} conversationHistory 
+ * @param {Object} lastSuggestion
+ * @param {Array} availableTools - Optional: Filter to these tools only (for agents)
+ * @param {string} agentName - Optional: Name of the agent calling this
+ * @param {string} requestId - Request identifier for logging
  * @returns {Promise<Array>} List of selected tools (or empty array)
  */
-async function selectTools(userMessage, conversationHistory, lastSuggestion = null) {
-    const toolDescriptions = getToolDescriptions();
+async function selectTools(userMessage, conversationHistory, lastSuggestion = null, availableTools = null, agentName = null, requestId = 'N/A') {
+    const Logger = require('../utils/logger');
+    const logger = new Logger('ToolSelector');
+
+    logger.info('Selecting tools', {
+        requestId,
+        agentName,
+        availableToolCount: availableTools ? availableTools.length : 'all'
+    });
+
+    // Get tool descriptions, filtered by availableTools if provided
+    let toolDescriptions = getToolDescriptions();
+
+    if (availableTools && availableTools.length > 0) {
+        // Filter to only the tools this agent owns
+        toolDescriptions = toolDescriptions.filter(td =>
+            availableTools.includes(td.name)
+        );
+
+        logger.info('Tools filtered for agent', {
+            requestId,
+            agentName,
+            totalTools: getToolDescriptions().length,
+            filteredTools: toolDescriptions.length
+        });
+    }
+
     const contextSummary = JSON.stringify(getContextSummary()).substring(0, 4000); // Limit context size
 
-    const suggestionContext = lastSuggestion ? `\nLAST BOT SUGGESTION (User might be responding to this):
-${JSON.stringify(lastSuggestion, null, 2)}` : '';
+    const suggestionContext = lastSuggestion ? `\nLAST BOT SUGGESTION (User might be responding to this):\n${JSON.stringify(lastSuggestion, null, 2)}` : '';
 
-    // --- NEW: INTENT RESOLVER LAYER ---
-    console.log('[ToolSelector] invoking Intent Resolver...');
-    const intentAdvice = await resolveIntent(userMessage, { conversation_history: conversationHistory });
-    let adviceContext = "";
+    // PHASE 5: Intent already resolved by AgentSelector, no need to call again
+    // This saves an AI call and prevents duplicate processing
+    let adviceContext = ""; // Keep it defined as an empty string if not used
 
-    if (intentAdvice) {
-        if (intentAdvice.confidence > 0.85) {
-            adviceContext = `\n*** INTENT ADVISOR ***\nUser clearly wants to: "${intentAdvice.intent}".\nADVICE: ${intentAdvice.advice}\n`;
-        } else if (intentAdvice.clarification_needed) {
-            adviceContext = `\n*** INTENT ADVISOR ***\nUser intent is AMBIGUOUS or CONFUSED (${intentAdvice.intent}).\nADVICE: ${intentAdvice.advice}\nConsider NOT calling a tool and instead asking for clarification.\n`;
-        } else {
-            adviceContext = `\n*** INTENT ADVISOR ***\nPossible intent: "${intentAdvice.intent}" (${(intentAdvice.confidence * 100).toFixed(0)}%).\nADVICE: ${intentAdvice.advice}\n`;
-        }
-    }
-    // ----------------------------------
+    const systemPrompt = `You are the AI Tool Selector for ${agentName} agent.
+Your ONLY goal: Select the best tools from YOUR AVAILABLE TOOLS to fulfill the user's request.
 
-    const systemPrompt = `You are the AI Orchestrator for the Be3 E-commerce Store.
-Your goal is to select the BEST tools to fulfill the user's request efficiently.
 ${suggestionContext}
-${adviceContext}
 
-CORE PRINCIPLES:
-1. DECISIVENESS: If the user asks for products or categories, use the appropriate tools immediately.
-2. NO REDUNDANCY: Do NOT call metadata tools (category.getInfo, attribute.list) if you can perform a search directly.
-3. SPECIFICITY: Use filters (category, attribute, vendor, price) in product.search whenever possible. 
-   - NEVER include price filters (e.g. "under 500", "cheap") or category names (e.g. "Phones") in the 'query' parameter if they can be placed in 'price_max', 'price_min', or 'category'. 
-   - DO include semantic descriptors like "for men", "blue", "gaming", or "original" in the 'query' as these trigger special logic.
-   - Example: For "phones under $500", use query: "phones", price_max: 500. NOT query: "phones under $500".
-4. SENTINEL: After ANY product.search call, you MUST immediately follow up with discovery.ensureSuggestion.
-5. REUSE & REFERENCES: If the user refers to a product from the previous turn (e.g. "add it", "the first one"), use "the_first_one", "the_second_one", or the product name in "product_id". NEVER use placeholders like "ID of the product".
-6. UNKNOWN PRODUCTS: If the user asks to perform an action (e.g. "add iPhone 13 to cart") on a specific product Name that is NOT in the active context/history, you MUST use 'product.search' to find it first. Do NOT use 'cart.add' with a made-up reference like "the_first_one" if the user hasn't seen a list yet.
-7. EXPLORATION: Use "category.list" to show top-level departments if the user asks "What do you sell?", "Show me your products", or "What do you have?". Use "product.search" for specific item exploration.
-8. IMAGES: If the user asks for "images", "pictures", "photos", or "what does it look like", usage of "product.getImage" is MANDATORY. This tool supports ALL the same search filters (category, price, etc.) as "product.search", so use it instead of "product.search" for visual requests.
-9. CATEGORY HIERARCHY (CRITICAL): Parent categories automatically include products from all child categories in search results. This means:
-   - If a user asks to see products in ANY category (parent or child), call "product.search" with that category directly. Do NOT force them to pick a child category first.
-   - You MAY present child categories as optional refinements AFTER showing results (e.g. "Want to narrow it down to just Phones or Tablets?"), but NEVER as a required step.
-   - Only use "category.list" to drill into subcategories if the user explicitly asks to browse or explore (e.g. "what types do you have?", "show me categories").
-   - Strong buying/browsing intent = search immediately. Exploration intent = show categories.
-   - "search in category" intent = use product.search with category filter. NEVER use category.list.
-   - "browse categories" intent = use category.list ONLY.
-   - browse known categories = use product.search with category filter. NEVER use category.list.
-10. COMPARE: If comparing products, use "product.compare".
-11. TARGETED VENDOR SEARCH: If the user mentions a specific product from a vendor (e.g. "their rattan drawers", "Samsung phone from Dareymi"), ALWAYS use "product.search" with the vendor's "tag" filter for precision. Only use "vendor.getProducts" for general inventory list requests like "What do they sell?".
-12. CONSOLIDATION: If you need to search for multiple variations (e.g. iPhone 12 and iPhone 13), use ONE "product.search" with a broader query. NEVER call the same search tool twice in one turn.
-13. STRICT OUTPUT: Return ONLY the JSON array. Do NOT explain your choices, do NOT say "Here are the tools", and do NOT provide a conversational response in this phase.
-14. VENDOR SEARCH PRIORITY: If the user asks for a product from a specific vendor (e.g., "Samsung phone from Dareymi", "that shop's phone"), you MUST use "product.search" with the vendor's "tag" filter. Only use "vendor.getProducts" if the user explicitly asks for a list of all products from a vendor (e.g., "What does Dareymi sell?").
-15. VENDOR LISTING: Use "vendor.list" ONLY when the user explicitly asks for "sellers" or "vendors". DO NOT use it for "what do you sell" (use "category.list" instead).
-16. PRIORITY: prioritize product tools like product.search over generic discovery.
-17. ADVISOR INDEPENDENCE: The "INTENT ADVISOR" provides high-level analysis based on conversation history. You should heavily consider its advice but verify it against the specific tools available. If the user's message contradicts the advice or if a better tool exists that the advisor missed, use your judgment. YOU have the final decision.
-18. CLARIFICATION: If the INTENT ADVISOR signals "AMBIGUOUS" or "CONFUSED" (clarification_needed: true), you MUST use "conversation.clarify" instead of guessing. Provide the possible interpretations in the "options" parameter.
+SELECTION PRINCIPLES:
+1. Use ONLY tools from the AVAILABLE TOOLS list below
+2. Be decisive - if a tool matches the request, select it
+3. Use tool parameters effectively (category, price, query, etc.)
+4. Return strict JSON format only
 
-AVAILABLE TOOLS:
+AVAILABLE TOOLS FOR ${agentName}:
 ${JSON.stringify(toolDescriptions, null, 2)}
+
 
 STORE CONTEXT (Category IDs, Slugs, Vendor Names):
 ${contextSummary}
@@ -160,6 +154,29 @@ Example:
         if (!Array.isArray(tools)) {
             console.warn('[ToolSelector] AI returned invalid tools format, defaulting to empty.');
             return [];
+        }
+
+        // PHASE 5: CRITICAL VALIDATION - Filter out tools not in availableTools list
+        if (availableTools && availableTools.length > 0) {
+            const originalCount = tools.length;
+            tools = tools.filter(tool => {
+                const isValid = availableTools.includes(tool.tool);
+                if (!isValid) {
+                    console.warn(`[ToolSelector] ❌ REJECTED: ${tool.tool} - Not available to ${agentName} agent`);
+                    logger.warn('Tool selection rejected', {
+                        requestId,
+                        agentName,
+                        rejectedTool: tool.tool,
+                        reason: 'Not in agent tool list'
+                    });
+                }
+                return isValid;
+            });
+
+            if (tools.length < originalCount) {
+                const rejectedCount = originalCount - tools.length;
+                console.warn(`[ToolSelector] 🚫 Rejected ${rejectedCount} hallucinated tool(s)`);
+            }
         }
 
         return tools;

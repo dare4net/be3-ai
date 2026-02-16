@@ -537,45 +537,85 @@ app.post('/chat', async (req, res) => {
 
         // Check if we should use the new Tool System
         if (shouldUseToolSystem(session_id)) {
-            console.log(`[Server] Routing session ${session_id} to NEW TOOL SYSTEM 🛠️`);
+            console.log(`[Server] Routing session ${session_id} to AGENT SYSTEM 🤖`);
+
+            // Generate unique request ID for logging
+            const { v4: uuidv4 } = require('uuid');
+            const requestId = uuidv4();
 
             // 1. Load State
             const state = await stateManager.getState(session_id);
             await stateManager.addMessage(session_id, 'user', message);
 
-            // 2. AI Tool Selection
-            console.log('[Tool System] Selecting tools...');
-            const lastSuggestion = await stateManager.getLastSuggestion(session_id);
-            let toolsSelected = await selectTools(message, state.conversation_history, lastSuggestion);
+            // 2. PHASE 5: Agent Selection
+            console.log('[Agent System] Selecting agent...');
+            const { selectAgent } = require('../agents/agentSelector');
 
-            // Check for retry intent
-            const isRetry = toolsSelected.some(t => t.tool === 'conversation.retry');
-            if (isRetry) {
-                console.log('[Tool System] User requested retry. Loading last tools from state...');
-                const lastTools = await stateManager.getLastTools(session_id);
-                if (lastTools && lastTools.length > 0) {
-                    toolsSelected = lastTools;
-                } else {
-                    console.warn('[Tool System] No last tools found in state to retry.');
-                }
-            } else if (toolsSelected.length > 0) {
-                // Save tools for potential retry 
-                await stateManager.setLastTools(session_id, toolsSelected);
-            }
+            const selection = await selectAgent({
+                userMessage: message,
+                sessionId: session_id,
+                history: state.conversation_history,
+                context: {
+                    sessionId: session_id,
+                    conversationHistory: state.conversation_history,
+                    lastSuggestion: await stateManager.getLastSuggestion(session_id)
+                },
+                requestId
+            });
 
-            // 3. Tool Execution
-            let toolResults = [];
-            if (toolsSelected.length > 0) {
-                console.log(`[Tool System] Tools selected: ${toolsSelected.map(t => t.tool).join(', ')}`);
-                toolResults = await executeTools(toolsSelected, session_id);
+            console.log(`[Agent System] Agent selected: ${selection.primaryAgent.name} (mode: ${selection.mode})`);
+
+            // 3. PHASE 5: Agent Execution
+            const agentOrchestrator = require('../agents/agentOrchestrator');
+            let executionResult;
+
+            if (selection.mode === 'SINGLE') {
+                executionResult = await agentOrchestrator.runSingle({
+                    agent: selection.primaryAgent,
+                    userMessage: message,
+                    context: {
+                        sessionId: session_id,
+                        conversationHistory: state.conversation_history,
+                        lastSuggestion: await stateManager.getLastSuggestion(session_id)
+                    },
+                    requestId
+                });
             } else {
-                console.log('[Tool System] No tools selected (pure conversation or unclear).');
+                executionResult = await agentOrchestrator.runChained({
+                    agents: [selection.primaryAgent, ...selection.chainedAgents],
+                    userMessage: message,
+                    context: {
+                        sessionId: session_id,
+                        conversationHistory: state.conversation_history,
+                        lastSuggestion: await stateManager.getLastSuggestion(session_id)
+                    },
+                    requestId
+                });
             }
 
-            // 4. Response Generation
-            console.log('[Tool System] Generating response via AI...');
-            const response = await generateResponseFromTools(message, toolResults, state.conversation_history);
-            console.log('[Tool System] AI response received.');
+            const toolResults = executionResult.toolResults || [];
+            let response = executionResult.response;
+
+            // 4. Personality Layer (ONLY for Support Agent)
+            // All other agents already have specialized prompts
+            if (selection.primaryAgent.name === 'Support') {
+                console.log('[Agent System] Applying personality layer for Support agent...');
+                const styleMessages = [
+                    {
+                        role: "system",
+                        content: getPersonalityRewritePrompt(response)
+                    },
+                    { role: "user", content: response }
+                ];
+
+                try {
+                    const styledResponse = await queryAI(styleMessages, 1024, 0.6);
+                    response = styledResponse || response;
+                } catch (error) {
+                    console.error('[Agent System] Personality layer failed:', error);
+                    // Keep original response
+                }
+            }
 
             // 4.5. IMAGE REINJECTION (Optimization Phase)
             // Restore images from Redis to the results so the frontend can display them
@@ -606,13 +646,15 @@ app.post('/chat', async (req, res) => {
             }
 
             // 5. Engagement Tracking (Phase 17)
+            const lastSuggestion = await stateManager.getLastSuggestion(session_id);
             if (lastSuggestion) {
                 const resultsWithSuggestions = toolResults.some(r => r.result && (r.result.suggestion_type === 'recovery' || r.result.suggestions));
 
                 // If AI selected a tool related to the last suggestion (e.g. search from category)
-                const acknowledged = toolsSelected.some(t =>
+                const toolsUsed = executionResult.tools || [];
+                const acknowledged = toolsUsed.some(t =>
                     t.tool === lastSuggestion.intent ||
-                    (t.params && JSON.stringify(t.params).includes(lastSuggestion.params.category))
+                    (t.params && JSON.stringify(t.params).includes(lastSuggestion.params?.category || ''))
                 );
 
                 if (acknowledged) {
@@ -634,23 +676,27 @@ app.post('/chat', async (req, res) => {
                 session_id,
                 user_message: message,
                 ai_reply: sanitizedResponse,
-                tools_used: toolsSelected.map(t => t.tool),
+                agent: selection.primaryAgent.name,
+                mode: selection.mode,
+                tools_used: executionResult.tools ? executionResult.tools.map(t => t.tool) : [],
                 results_count: toolResults.length
             };
-            logStep(`FINAL_RESPONSE (ToolSystem): ${JSON.stringify(finalPayload, null, 2)}`);
+            logStep(`FINAL_RESPONSE (AgentSystem): ${JSON.stringify(finalPayload, null, 2)}`);
 
             // Track metrics
-            trackRequest('toolSystem', {
-                apiCalls: toolResults.filter(r => r.result && r.result.apiCalls).length, // Approximation
+            trackRequest('agentSystem', {
+                agent: selection.primaryAgent.name,
+                mode: selection.mode,
+                apiCalls: toolResults.filter(r => r.result && r.result.apiCalls).length,
                 responseTime: Date.now() - startTime,
                 error: toolResults.some(r => !r.success),
-                tools: toolsSelected.map(t => t.tool)
+                tools: executionResult.tools ? executionResult.tools.map(t => t.tool) : []
             });
 
             return res.json({
                 success: true,
                 reply: sanitizedResponse,
-                tools_used: toolsSelected,
+                tools_used: executionResult.tools ? executionResult.tools.map(t => t.tool) : [],
                 results: toolResults,
                 display_images: imagesToSend  // Smart image metadata
             });
